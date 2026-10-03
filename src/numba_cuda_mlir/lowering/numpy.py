@@ -3717,7 +3717,9 @@ def np_log_array_to_array_cg(builder, target, args, kwargs):
 # Binary ufunc helpers
 
 
-def create_binary_elementwise_op(builder, target, args, kwargs, math_fn, op_name):
+def create_binary_elementwise_op(
+    builder, target, args, kwargs, math_fn, op_name, convert_inputs=True
+):
     """
     Helper for implementing binary element-wise operations using linalg.GenericOp.
 
@@ -3731,6 +3733,8 @@ def create_binary_elementwise_op(builder, target, args, kwargs, math_fn, op_name
         kwargs: Keyword arguments (should be empty)
         math_fn: Function(in1_elem, in2_elem) -> result
         op_name: Name of the operation for error messages
+        convert_inputs: If True, convert inputs to the target type before calling math_fn.
+                       Set to False for functions that convert the inputs themselves.
     """
     assert len(args) == 2 and len(kwargs) == 0, f"{op_name} takes exactly two arguments"
     in1_arg, in2_arg = args
@@ -3791,10 +3795,19 @@ def create_binary_elementwise_op(builder, target, args, kwargs, math_fn, op_name
     in1_elem = block.arguments[0]
     in2_elem = block.arguments[1]
     with ir.InsertionPoint(block):
-        # Convert inputs to target type
-        in1_elem_conv = lowering_utilities.convert(in1_elem, target_mlir_type)
-        in2_elem_conv = lowering_utilities.convert(in2_elem, target_mlir_type)
-        result = math_fn(in1_elem_conv, in2_elem_conv)
+        if convert_inputs:
+            # Convert inputs to target type, each as its own signedness requires
+            in1_elem = lowering_utilities.convert(
+                in1_elem,
+                target_mlir_type,
+                signed=get_conversion_signedness(in1_element_type, target_element_type),
+            )
+            in2_elem = lowering_utilities.convert(
+                in2_elem,
+                target_mlir_type,
+                signed=get_conversion_signedness(in2_element_type, target_element_type),
+            )
+        result = math_fn(in1_elem, in2_elem)
         result = lowering_utilities.convert(result, target_mlir_type)
         linalg.yield_([result])
 
@@ -3835,7 +3848,7 @@ def create_binary_elementwise_op_with_output(
 
     Args:
         convert_inputs: If True, convert inputs to output type before operation.
-                       Set to False for comparisons where inputs stay in original type.
+                       Set to False for functions that convert the inputs themselves.
     """
     assert len(args) == 3, f"{op_name} expects 3 arguments (in1, in2, output)"
     in1_arg, in2_arg, output_arg = args
@@ -3883,8 +3896,17 @@ def create_binary_elementwise_op_with_output(
     in2_elem = block.arguments[1]
     with ir.InsertionPoint(block):
         if convert_inputs:
-            in1_elem = convert(in1_elem, output_mlir_elem_type)
-            in2_elem = convert(in2_elem, output_mlir_elem_type)
+            # Each input converts as its own signedness requires
+            in1_elem = convert(
+                in1_elem,
+                output_mlir_elem_type,
+                signed=get_conversion_signedness(in1_array_type.dtype, output_array_type.dtype),
+            )
+            in2_elem = convert(
+                in2_elem,
+                output_mlir_elem_type,
+                signed=get_conversion_signedness(in2_array_type.dtype, output_array_type.dtype),
+            )
         result = math_fn(in1_elem, in2_elem)
         result = convert(result, output_mlir_elem_type)
         result = lowering_utilities.value_to_storage(output_array_type.dtype, result)
@@ -4091,6 +4113,45 @@ _not_equal_fn = _create_comparison_fn(
 )
 
 
+def _comparison_type(builder, a_type, b_type):
+    """The MLIR type NumPy compares two scalar types in, and whether it is signed.
+
+    That is their promoted type, except for a signed integer and a uint64, which
+    NumPy compares exactly rather than as floats: 128 bits hold both.
+    """
+    common = np.promote_types(numpy_support.as_dtype(a_type), numpy_support.as_dtype(b_type))
+    if (
+        common.kind == "f"
+        and isinstance(a_type, types.Integer)
+        and isinstance(b_type, types.Integer)
+    ):
+        return ir.IntegerType.get_signless(128), True
+    return builder.get_value_type(numpy_support.from_dtype(common)), common.kind not in "bu"
+
+
+def _comparison_op(builder, cmp_fn, a_type, b_type):
+    """cmp_fn for values of scalar types a_type and b_type, compared as NumPy does."""
+    value_type, signed = _comparison_type(builder, a_type, b_type)
+    a_signed = get_conversion_signedness(a_type, a_type)
+    b_signed = get_conversion_signedness(b_type, b_type)
+
+    def compare(a, b):
+        a = convert(a, value_type, signed=a_signed)
+        b = convert(b, value_type, signed=b_signed)
+        return cmp_fn(a, b, signed=signed)
+
+    return compare
+
+
+def _comparison_array_to_array(builder, target, args, cmp_fn, op_name):
+    """cmp(a, b, out) on arrays, comparing as NumPy does."""
+    a_type, b_type = (builder.get_numba_type(arg.name).dtype for arg in args[:2])
+    compare = _comparison_op(builder, cmp_fn, a_type, b_type)
+    create_binary_elementwise_op_with_output(
+        builder, target, args, compare, op_name, convert_inputs=False
+    )
+
+
 def _create_comparison_scalar_lowering(cmp_fn, op_name):
     """Create a scalar comparison lowering that stores result in output array."""
 
@@ -4099,7 +4160,8 @@ def _create_comparison_scalar_lowering(cmp_fn, op_name):
         a = builder.load_var(args[0])
         b = builder.load_var(args[1])
         out_arr = builder.load_var(args[2])
-        result = cmp_fn(a, b)
+        a_type, b_type = (builder.get_numba_type(arg.name) for arg in args[:2])
+        result = _comparison_op(builder, cmp_fn, a_type, b_type)(a, b)
         # Convert i1 result to output value type, then to storage.
         output_array_type = builder.get_numba_type(args[2].name)
         elem_type = builder.get_value_type(output_array_type.dtype)
@@ -4119,9 +4181,7 @@ def np_greater_scalar_to_array_cg(builder, target, args, kwargs):
 @lower(np.greater, types.Array, types.Array, types.Array)
 def np_greater_array_to_array_cg(builder, target, args, kwargs):
     """greater(a, b, out) - element-wise a > b"""
-    create_binary_elementwise_op_with_output(
-        builder, target, args, _greater_fn, "np.greater", convert_inputs=False
-    )
+    _comparison_array_to_array(builder, target, args, _greater_fn, "np.greater")
 
 
 @lower(np.greater_equal, types.Number, types.Number, types.Array)
@@ -4134,14 +4194,7 @@ def np_greater_equal_scalar_to_array_cg(builder, target, args, kwargs):
 @lower(np.greater_equal, types.Array, types.Array, types.Array)
 def np_greater_equal_array_to_array_cg(builder, target, args, kwargs):
     """greater_equal(a, b, out) - element-wise a >= b"""
-    create_binary_elementwise_op_with_output(
-        builder,
-        target,
-        args,
-        _greater_equal_fn,
-        "np.greater_equal",
-        convert_inputs=False,
-    )
+    _comparison_array_to_array(builder, target, args, _greater_equal_fn, "np.greater_equal")
 
 
 @lower(np.less, types.Number, types.Number, types.Array)
@@ -4152,9 +4205,7 @@ def np_less_scalar_to_array_cg(builder, target, args, kwargs):
 @lower(np.less, types.Array, types.Array, types.Array)
 def np_less_array_to_array_cg(builder, target, args, kwargs):
     """less(a, b, out) - element-wise a < b"""
-    create_binary_elementwise_op_with_output(
-        builder, target, args, _less_fn, "np.less", convert_inputs=False
-    )
+    _comparison_array_to_array(builder, target, args, _less_fn, "np.less")
 
 
 @lower(np.less_equal, types.Number, types.Number, types.Array)
@@ -4167,9 +4218,7 @@ def np_less_equal_scalar_to_array_cg(builder, target, args, kwargs):
 @lower(np.less_equal, types.Array, types.Array, types.Array)
 def np_less_equal_array_to_array_cg(builder, target, args, kwargs):
     """less_equal(a, b, out) - element-wise a <= b"""
-    create_binary_elementwise_op_with_output(
-        builder, target, args, _less_equal_fn, "np.less_equal", convert_inputs=False
-    )
+    _comparison_array_to_array(builder, target, args, _less_equal_fn, "np.less_equal")
 
 
 @lower(np.equal, types.Number, types.Number, types.Array)
@@ -4180,9 +4229,7 @@ def np_equal_scalar_to_array_cg(builder, target, args, kwargs):
 @lower(np.equal, types.Array, types.Array, types.Array)
 def np_equal_array_to_array_cg(builder, target, args, kwargs):
     """equal(a, b, out) - element-wise a == b"""
-    create_binary_elementwise_op_with_output(
-        builder, target, args, _equal_fn, "np.equal", convert_inputs=False
-    )
+    _comparison_array_to_array(builder, target, args, _equal_fn, "np.equal")
 
 
 @lower(np.not_equal, types.Number, types.Number, types.Array)
@@ -4193,9 +4240,7 @@ def np_not_equal_scalar_to_array_cg(builder, target, args, kwargs):
 @lower(np.not_equal, types.Array, types.Array, types.Array)
 def np_not_equal_array_to_array_cg(builder, target, args, kwargs):
     """not_equal(a, b, out) - element-wise a != b"""
-    create_binary_elementwise_op_with_output(
-        builder, target, args, _not_equal_fn, "np.not_equal", convert_inputs=False
-    )
+    _comparison_array_to_array(builder, target, args, _not_equal_fn, "np.not_equal")
 
 
 # Logical ufuncs
@@ -4363,56 +4408,104 @@ def _fmin_fn(a, b, signed=True):
         return arith.minimumf(a, b)
 
 
+def _min_max_op(builder, min_max_fn, a_type, b_type, out_type):
+    """min_max_fn for values of scalar types a_type and b_type, giving an out_type value.
+
+    As in NumPy, integers are compared in their promoted type and its signedness, and
+    then cast, since casting them first could wrap them. Values cast to a float keep
+    their order, so they are compared in a float out_type directly.
+    """
+    if isinstance(out_type, types.Float):
+        compute_type = out_type
+    else:
+        compute_type = numpy_support.from_dtype(
+            np.promote_types(numpy_support.as_dtype(a_type), numpy_support.as_dtype(b_type))
+        )
+    value_type = builder.get_value_type(compute_type)
+    out_value_type = builder.get_value_type(out_type)
+    # Unsigned integers and booleans compare as unsigned
+    signed = get_conversion_signedness(compute_type, compute_type) is not False
+
+    def min_max(a, b):
+        a = convert(a, value_type, signed=get_conversion_signedness(a_type, compute_type))
+        b = convert(b, value_type, signed=get_conversion_signedness(b_type, compute_type))
+        result = min_max_fn(a, b, signed=signed)
+        return convert(
+            result, out_value_type, signed=get_conversion_signedness(compute_type, out_type)
+        )
+
+    return min_max
+
+
+def _min_max_array(builder, target, args, kwargs, min_max_fn, op_name):
+    """Min/max ufunc on two arrays, returning a new array."""
+    a_type, b_type = (builder.get_numba_type(arg.name).dtype for arg in args)
+    out_type = builder.get_numba_type(target.name).dtype
+    min_max = _min_max_op(builder, min_max_fn, a_type, b_type, out_type)
+    create_binary_elementwise_op(
+        builder, target, args, kwargs, min_max, op_name, convert_inputs=False
+    )
+
+
+def _min_max_array_to_array(builder, target, args, min_max_fn, op_name):
+    """Min/max ufunc on two arrays, stored in an output array."""
+    a_type, b_type, out_type = (builder.get_numba_type(arg.name).dtype for arg in args)
+    min_max = _min_max_op(builder, min_max_fn, a_type, b_type, out_type)
+    create_binary_elementwise_op_with_output(
+        builder, target, args, min_max, op_name, convert_inputs=False
+    )
+
+
 @ufunc_registry.register(np.maximum)
 @lower(np.maximum, types.Array, types.Array)
 def np_maximum_array_cg(builder, target, args, kwargs):
     """Element-wise maximum using linalg.GenericOp."""
-    create_binary_elementwise_op(builder, target, args, kwargs, _maximum_fn, "np.maximum")
+    _min_max_array(builder, target, args, kwargs, _maximum_fn, "np.maximum")
 
 
 @lower(np.maximum, types.Array, types.Array, types.Array)
 def np_maximum_array_to_array_cg(builder, target, args, kwargs):
     """maximum(a, b, out) - element-wise max(a, b)"""
-    create_binary_elementwise_op_with_output(builder, target, args, _maximum_fn, "np.maximum")
+    _min_max_array_to_array(builder, target, args, _maximum_fn, "np.maximum")
 
 
 @ufunc_registry.register(np.minimum)
 @lower(np.minimum, types.Array, types.Array)
 def np_minimum_array_cg(builder, target, args, kwargs):
     """Element-wise minimum using linalg.GenericOp."""
-    create_binary_elementwise_op(builder, target, args, kwargs, _minimum_fn, "np.minimum")
+    _min_max_array(builder, target, args, kwargs, _minimum_fn, "np.minimum")
 
 
 @lower(np.minimum, types.Array, types.Array, types.Array)
 def np_minimum_array_to_array_cg(builder, target, args, kwargs):
     """minimum(a, b, out) - element-wise min(a, b)"""
-    create_binary_elementwise_op_with_output(builder, target, args, _minimum_fn, "np.minimum")
+    _min_max_array_to_array(builder, target, args, _minimum_fn, "np.minimum")
 
 
 @ufunc_registry.register(np.fmax)
 @lower(np.fmax, types.Array, types.Array)
 def np_fmax_array_cg(builder, target, args, kwargs):
     """Element-wise fmax using linalg.GenericOp."""
-    create_binary_elementwise_op(builder, target, args, kwargs, _fmax_fn, "np.fmax")
+    _min_max_array(builder, target, args, kwargs, _fmax_fn, "np.fmax")
 
 
 @lower(np.fmax, types.Array, types.Array, types.Array)
 def np_fmax_array_to_array_cg(builder, target, args, kwargs):
     """fmax(a, b, out) - element-wise fmax (NaN-ignoring max)"""
-    create_binary_elementwise_op_with_output(builder, target, args, _fmax_fn, "np.fmax")
+    _min_max_array_to_array(builder, target, args, _fmax_fn, "np.fmax")
 
 
 @ufunc_registry.register(np.fmin)
 @lower(np.fmin, types.Array, types.Array)
 def np_fmin_array_cg(builder, target, args, kwargs):
     """Element-wise fmin using linalg.GenericOp."""
-    create_binary_elementwise_op(builder, target, args, kwargs, _fmin_fn, "np.fmin")
+    _min_max_array(builder, target, args, kwargs, _fmin_fn, "np.fmin")
 
 
 @lower(np.fmin, types.Array, types.Array, types.Array)
 def np_fmin_array_to_array_cg(builder, target, args, kwargs):
     """fmin(a, b, out) - element-wise fmin (NaN-ignoring min)"""
-    create_binary_elementwise_op_with_output(builder, target, args, _fmin_fn, "np.fmin")
+    _min_max_array_to_array(builder, target, args, _fmin_fn, "np.fmin")
 
 
 # Bitwise ufuncs
@@ -4626,10 +4719,23 @@ def _create_binary_scalar_to_output_array(builder, target, args, math_fn, op_nam
     out_arr = builder.load_var(args[2])
     output_array_type = builder.get_numba_type(args[2].name)
     elem_type = builder.get_value_type(output_array_type.dtype)
-    a = convert(a, elem_type)
-    b = convert(b, elem_type)
+    a_type, b_type = (builder.get_numba_type(arg.name) for arg in args[:2])
+    a = convert(a, elem_type, signed=get_conversion_signedness(a_type, output_array_type.dtype))
+    b = convert(b, elem_type, signed=get_conversion_signedness(b_type, output_array_type.dtype))
     result = math_fn(a, b)
     result = convert(result, elem_type)
+    _store_first_output_value(builder, args[2], out_arr, result)
+    builder.store_var(target, out_arr)
+
+
+def _min_max_scalar_to_output_array(builder, target, args, min_max_fn):
+    """Min/max ufunc on two scalars, stored in output_array[0]."""
+    assert len(args) == 3
+    a_type, b_type = (builder.get_numba_type(arg.name) for arg in args[:2])
+    out_type = builder.get_numba_type(args[2].name).dtype
+    min_max = _min_max_op(builder, min_max_fn, a_type, b_type, out_type)
+    result = min_max(builder.load_var(args[0]), builder.load_var(args[1]))
+    out_arr = builder.load_var(args[2])
     _store_first_output_value(builder, args[2], out_arr, result)
     builder.store_var(target, out_arr)
 
@@ -4637,25 +4743,25 @@ def _create_binary_scalar_to_output_array(builder, target, args, math_fn, op_nam
 @lower(np.maximum, types.Number, types.Number, types.Array)
 def np_maximum_scalar_to_array_cg(builder, target, args, kwargs):
     """maximum(a, b, out) - scalar max(a, b) to output array"""
-    _create_binary_scalar_to_output_array(builder, target, args, _maximum_fn, "np.maximum")
+    _min_max_scalar_to_output_array(builder, target, args, _maximum_fn)
 
 
 @lower(np.minimum, types.Number, types.Number, types.Array)
 def np_minimum_scalar_to_array_cg(builder, target, args, kwargs):
     """minimum(a, b, out) - scalar min(a, b) to output array"""
-    _create_binary_scalar_to_output_array(builder, target, args, _minimum_fn, "np.minimum")
+    _min_max_scalar_to_output_array(builder, target, args, _minimum_fn)
 
 
 @lower(np.fmax, types.Number, types.Number, types.Array)
 def np_fmax_scalar_to_array_cg(builder, target, args, kwargs):
     """fmax(a, b, out) - scalar fmax(a, b) to output array"""
-    _create_binary_scalar_to_output_array(builder, target, args, _fmax_fn, "np.fmax")
+    _min_max_scalar_to_output_array(builder, target, args, _fmax_fn)
 
 
 @lower(np.fmin, types.Number, types.Number, types.Array)
 def np_fmin_scalar_to_array_cg(builder, target, args, kwargs):
     """fmin(a, b, out) - scalar fmin(a, b) to output array"""
-    _create_binary_scalar_to_output_array(builder, target, args, _fmin_fn, "np.fmin")
+    _min_max_scalar_to_output_array(builder, target, args, _fmin_fn)
 
 
 @lower(np.bitwise_and, types.Integer, types.Integer, types.Array)
@@ -4709,15 +4815,14 @@ def _binary_scalar_ufunc(math_fn):
 
 
 def _min_max_scalar_ufunc(min_max_fn):
-    """Min/max ufunc on scalars, compared in the result type and its signedness."""
+    """Min/max ufunc on scalars, compared as NumPy does."""
 
     def lowering(builder, target, args, kwargs):
         assert len(args) == 2 and len(kwargs) == 0
-        value_type = builder.get_mlir_type(target)
-        a, b = (_load_scalar_as(builder, arg, value_type) for arg in args)
+        a_type, b_type = (builder.get_numba_type(arg.name) for arg in args)
         result_type = builder.get_numba_type(target.name)
-        signed = not isinstance(result_type, types.Integer) or result_type.signed
-        builder.store_var(target, min_max_fn(a, b, signed=signed))
+        min_max = _min_max_op(builder, min_max_fn, a_type, b_type, result_type)
+        builder.store_var(target, min_max(*(builder.load_var(arg) for arg in args)))
 
     return lowering
 
@@ -4728,21 +4833,9 @@ def _comparison_scalar_ufunc(cmp_fn):
     def lowering(builder, target, args, kwargs):
         assert len(args) == 2 and len(kwargs) == 0
         a_type, b_type = (builder.get_numba_type(arg.name) for arg in args)
-        common = np.promote_types(numpy_support.as_dtype(a_type), numpy_support.as_dtype(b_type))
-        if (
-            common.kind == "f"
-            and isinstance(a_type, types.Integer)
-            and isinstance(b_type, types.Integer)
-        ):
-            # A signed integer and a uint64, which NumPy compares exactly rather
-            # than as floats: 128 bits hold both
-            value_type, signed = ir.IntegerType.get_signless(128), True
-        else:
-            value_type = builder.get_value_type(numpy_support.from_dtype(common))
-            signed = common.kind != "u"
-        a, b = (_load_scalar_as(builder, arg, value_type) for arg in args)
-        result = _bool_to_value_type(cmp_fn(a, b, signed=signed), builder.get_mlir_type(target))
-        builder.store_var(target, result)
+        compare = _comparison_op(builder, cmp_fn, a_type, b_type)
+        result = compare(*(builder.load_var(arg) for arg in args))
+        builder.store_var(target, _bool_to_value_type(result, builder.get_mlir_type(target)))
 
     return lowering
 
